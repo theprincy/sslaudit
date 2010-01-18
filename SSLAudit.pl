@@ -5,14 +5,10 @@ use strict;
 
 use Socket;
 use Net::SSLeay qw(die_now die_if_ssl_error);
-use File::Spec::Functions qw(rel2abs);
-use File::Basename;
 
 use Config::IniFiles;
 use IO::Socket::SSL;
-use Data::Dumper;
 
-use Text::Template;
 use Time::gmtime;
 use Time::ParseDate;
 
@@ -20,14 +16,15 @@ Net::SSLeay::load_error_strings();
 Net::SSLeay::SSLeay_add_ssl_algorithms();
 Net::SSLeay::randomize();
 
+sub get_dates;
+sub get_pem;
+sub check_dates;
 sub check_port;
 sub check_hostname;
 sub check_protocol_cipher;
 sub letter_grade;
 sub grade_result;
-sub get_dates;
-sub report_csv;
-sub report_html;
+sub get_peer_certificate;
 
 sub get_dates {
 	my ( $dest_serv, $port ) = @_;    # Read command line
@@ -154,9 +151,6 @@ sub check_hostname {
 
 	# Verify hostname / CN Name
 	my ( $host, $port ) = @_;
-
-	#print "check_hostname($host, $port)\n";
-
 	my %server_options = (
 						   PeerAddr => $host,
 						   PeerPort => $port
@@ -169,12 +163,12 @@ sub check_hostname {
 			  . $client->peer_certificate('commonName')
 			  . " != $host\n";
 
-			#print "\n\n";
-			#print "Protocol grade: N/A (-)\n";
-			#print "Cipher grade: N/A (-)\n";
-			#print "\n";
-			#print "Summary grade: 0 (F)\n";
-			#print "\n\n";
+			print "\n\n";
+			print "Protocol grade: N/A (-)\n";
+			print "Cipher grade: N/A (-)\n";
+			print "\n";
+			print "Summary grade: 0 (F)\n";
+			print "\n\n";
 
 			return 1;
 		} else {
@@ -182,7 +176,6 @@ sub check_hostname {
 			  . $client->peer_certificate('commonName')
 			  . " == Hostname: $host\n";
 
-			#print "\n\n" . $client->dump_peer_certificate() . "\n\n";
 			return 0;
 		}
 	}
@@ -211,8 +204,6 @@ sub check_protocol_cipher {
 sub letter_grade {
 	my $score = shift(@_);
 	my $grade;
-
-	#print "letter_grade($score)\n";
 
 	if ( $score >= 80 ) {
 		$grade = "A";
@@ -247,58 +238,6 @@ sub grade_result {
 	return ( $score, $grade );
 }
 
-sub report_csv {
-	my @report_result = @_;
-
-	open REPORT_CSV, ">", "sslaudit_report.csv" or die $!;
-	print REPORT_CSV "Protocol,Cipher,Enabled,Score\n";
-
-	my $csv_result;
-	foreach $csv_result (@report_result) {
-		print REPORT_CSV $csv_result->{Protocol} . ","
-		  . $csv_result->{Cipher} . ","
-		  . $csv_result->{Enabled} . ","
-		  . $csv_result->{Score} . "\n";
-
-	}
-	close(REPORT_CSV);
-}
-
-sub report_html {
-	my $report_result = @_;
-
-	my $template = Text::Template->new( SOURCE => 'sslaudit_html.tmpl' )
-	  or die "Couldn't construct template: $Text::Template::ERROR";
-
-	open REPORT_HTML, ">", "sslaudit_report.html" or die $!;
-
-	my $html_report = $template->fill_in( HASH => \$report_result );
-
-	print REPORT_HTML $html_report;
-	close(REPORT_HTML);
-
-	print $html_report;
-}
-
-my $numArgs = @ARGV;
-my ( $host, $port );
-
-my @protocol_scores;
-my @cipher_scores;
-
-if ( ( $numArgs < 1 ) || ( $numArgs > 2 ) ) {
-	print "Usage: sslaudit.pl host [port]";
-	exit;
-} else {
-	$host = $ARGV[0];
-
-	if ( $numArgs == 2 ) {
-		$port = $ARGV[1];
-	} else {
-		$port = 443;
-	}
-}
-
 sub get_peer_certificate {
 
 	# Verify hostname / CN Name
@@ -316,20 +255,39 @@ sub get_peer_certificate {
 	} else {
 		return -1;
 	}
+}
 
+my $numArgs = @ARGV;
+my ( $host, $port );
+
+my @protocol_scores = ();
+my @cipher_scores   = ();
+
+if ( ( $numArgs < 1 ) || ( $numArgs > 2 ) ) {
+	print "Usage: sslaudit.pl host [port]";
+	exit;
+} else {
+	$host = $ARGV[0];
+
+	if ( $numArgs == 2 ) {
+		$port = $ARGV[1];
+	} else {
+		$port = 443;
+	}
 }
 
 if ( check_port( $host, $port ) ) {
 	if ( !check_hostname( $host, $port ) ) {
-		my $pem = get_pem( $host, $port );
-		print $pem;
-
 		my $peer_certificate = get_peer_certificate( $host, $port );
 		print $peer_certificate;
 
+		my $pem = get_pem( $host, $port );
+		print "\n" . $pem . "\n";
+
 		check_dates( $host, $port );
 
-		# Test supported protocols and ciphers
+		print "\n\n";
+
 		my $filename = "sslaudit.ini";
 
 		my $cfg = new Config::IniFiles( -file => $filename )
@@ -350,11 +308,14 @@ if ( check_port( $host, $port ) ) {
 
 				if ($success) {
 					$score = $cfg->val( $protocol, $cipher );
-					$score =~ s/[\#\;].*//g;
-					if ( $cipher =~ m/"DEFAULT"/i ) {
-						push @protocol_scores, $score;
+					$score =~ s/\s*[\#\;].*//g
+					  ;    # Remove comments and whitespace before comments
+					if ( $cipher =~ m/DEFAULT/i ) {
+						push @protocol_scores, $score
+						  ; # The "DEFAULT" cipher is being tested, i.e. the protocol itself
 					} else {
-						push @cipher_scores, $score;
+						push @cipher_scores,
+						  $score;    # A particular cipher is being tested
 					}
 					print " - successfull - $score\n";
 					$enabled = 1;
@@ -363,9 +324,10 @@ if ( check_port( $host, $port ) ) {
 					$enabled = 0;
 					$score   = '';
 				}
-
 			}
 			if ( @cipher_scores > 0 ) {
+
+				# We got some cipher scores
 				my ( $cipher_score, $cipher_grade ) =
 				  grade_result(@cipher_scores);
 
@@ -377,19 +339,13 @@ if ( check_port( $host, $port ) ) {
 				print "$protocol not supported by server\n";
 				print "\n\n";
 			}
-
 		}
 		if ( @protocol_scores > 0 ) {
 			my ( $protocol_score, $protocol_grade ) =
 			  grade_result(@protocol_scores);
-			print "\n\n";
 			print "Protocol score: $protocol_score ($protocol_grade)\n";
 			print "\n\n";
 		}
-
-		#report_csv( @report_results );
-		#print Dumper( $result_data );
-		#report_html( $result_data );
 	} else {
 		print "Hostname missmatch\n";
 	}
